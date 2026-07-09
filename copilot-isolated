@@ -1,0 +1,230 @@
+#!/usr/bin/env bash
+# copilot-isolated — launch a sandboxed, skip-permissions Copilot CLI session for
+# the current directory. Each invocation is a fresh, ephemeral container, so you
+# can run many concurrently (one per tmux pane / project) with no shared state.
+#
+#   Usage:  cd <project> && copilot-isolated [copilot args...]
+#
+# The container drops all capabilities except three the ROOT entrypoint needs
+# transiently — NET_ADMIN (program iptables), SETUID/SETGID (drop root -> the
+# 'proxy' and 'agent' users). All three are gone the instant root becomes the
+# agent (changing uid clears capabilities), so the agent never holds them.
+#
+# Config isolation: your real ~/.copilot is mounted READ-ONLY (as /seed) and only
+# copied from — the sandbox can never modify your host config. Your ~/.config/gh
+# is mounted READ-ONLY (as /seed-gh) for auth. Conversations and session state
+# persist to a SEPARATE host dir ($STATE_DIR, default ~/.copilot-isolated).
+# All egress goes through an in-container domain-allowlist proxy. See the README.
+set -euo pipefail
+
+IMAGE="${COPILOT_ISOLATED_IMAGE:-copilot-sandbox:latest}"
+ENVFILE="${COPILOT_ISOLATED_ENV:-$HOME/.config/copilot-isolated/env}"
+COPILOT_DIR="${COPILOT_ISOLATED_COPILOT_DIR:-$HOME/.copilot}"
+# Canonicalize before anything derives from it. If ~/.copilot is a symlink,
+# Copilot CLI may bake the *real* target into config paths. Resolving here
+# keeps HOST_COPILOT_DIR equal to the path the config actually references.
+COPILOT_DIR="$(realpath "$COPILOT_DIR" 2>/dev/null || printf '%s' "$COPILOT_DIR")"
+GH_CONFIG_DIR="${COPILOT_ISOLATED_GH_DIR:-$HOME/.config/gh}"
+# Persistent, host-separate sandbox state (sessions, logs).
+# Defaults to a sibling of your config dir on the same volume.
+STATE_DIR="${COPILOT_ISOLATED_STATE:-$(dirname "$COPILOT_DIR")/.copilot-isolated}"
+# Host-side, structured (non-secret) settings — read-only auxiliary mounts, etc.
+# NEVER mounted into the container, so the agent cannot author it.
+CONFIG_FILE="${COPILOT_ISOLATED_CONFIG:-$HOME/.config/copilot-isolated/config.json}"
+
+die() { echo "copilot-isolated: $*" >&2; exit 1; }
+
+# --- Preconditions -----------------------------------------------------------
+command -v docker >/dev/null 2>&1 || die "docker not found on PATH"
+docker image inspect "$IMAGE" >/dev/null 2>&1 \
+    || die "image '$IMAGE' not found — build it first:  docker build -t $IMAGE $(dirname "$0")"
+command -v jq >/dev/null 2>&1 || die "jq not found on PATH (required to parse config)"
+
+[ -d "$COPILOT_DIR" ] || die "copilot config dir '$COPILOT_DIR' not found"
+
+# Ensure the env file exists; scaffold a template on first run.
+if [ ! -f "$ENVFILE" ]; then
+    mkdir -p "$(dirname "$ENVFILE")"
+    cat > "$ENVFILE" <<'TEMPLATE'
+# copilot-isolated environment — NOT committed. One VAR=value per line.
+#
+# Fine-grained GitHub PAT, scoped to the repos you want the sandbox to push to
+# (contents:rw + pull_requests:rw). Also used by Copilot CLI for authentication
+# (needs "Copilot Requests" permission for fine-grained PATs).
+# Classic personal access tokens (ghp_) are NOT supported by Copilot CLI.
+GH_TOKEN=
+# Commit identity (git also reads these two directly when committing).
+GIT_AUTHOR_NAME=
+GIT_AUTHOR_EMAIL=
+# Optional: override Copilot's auth token (takes precedence over GH_TOKEN for
+# Copilot inference). Fine-grained PAT with "Copilot Requests" permission.
+# COPILOT_GITHUB_TOKEN=
+TEMPLATE
+    chmod 600 "$ENVFILE"
+    die "created env template at '$ENVFILE' — fill in GH_TOKEN (and identity), then re-run"
+fi
+
+# Prepare the persistent, host-separate state dir.
+mkdir -p "$STATE_DIR"
+[ -e "$STATE_DIR/config.json" ] || echo '{}' > "$STATE_DIR/config.json"
+[ -f "$STATE_DIR/config.json" ] || die "'$STATE_DIR/config.json' exists but is not a regular file"
+
+# --- Stable per-project identity ---------------------------------------------
+project_base="$(basename "$PWD")"
+project_base="${project_base//[!A-Za-z0-9._-]/_}"
+project_hash="$(printf '%s' "$PWD" | sha256sum | cut -c1-12)"
+PROJECT_KEY="${project_base}-${project_hash}"
+
+# --- Seed the host-side egress allowlist on first run -------------------------
+if [ ! -f "$CONFIG_FILE" ]; then
+    mkdir -p "$(dirname "$CONFIG_FILE")"
+    cat > "$CONFIG_FILE" <<'SEED'
+{
+  "domains": [
+    ".github.com",
+    ".githubusercontent.com",
+    ".githubcopilot.com",
+    ".api.githubcopilot.com",
+    ".npmjs.org",
+    ".npmjs.com",
+    "pypi.org",
+    ".pythonhosted.org",
+    ".playwright.azureedge.net",
+    ".playwright.dev",
+    "playwright.download.prss.microsoft.com",
+    ".context7.com",
+    ".upstash.io",
+    ".readthedocs.io",
+    "developer.mozilla.org",
+    "docs.python.org",
+    "pkg.go.dev",
+    ".nodejs.org",
+    ".hashicorp.com",
+    "registry.terraform.io"
+  ],
+  "projects": {},
+  "mounts": [],
+  "ports": []
+}
+SEED
+    echo "copilot-isolated: seeded default egress allowlist at '$CONFIG_FILE'" >&2
+fi
+
+# --- Host-controlled config: egress allowlist + mounts + dev-server ports ------
+ALLOW_DOMAINS=""
+MOUNT_ARGS=()
+PORT_ARGS=()
+INPUT_PORTS=""
+if [ -f "$CONFIG_FILE" ]; then
+    jq empty "$CONFIG_FILE" >/dev/null 2>&1 \
+        || die "config '$CONFIG_FILE' is not valid JSON"
+
+    if ! domains_raw="$(jq -r \
+            '((.domains // []) + (.projects[$pwd].domains // []))[]' \
+            --arg pwd "$PWD" "$CONFIG_FILE" 2>/dev/null)"; then
+        die "config '$CONFIG_FILE': 'domains' must be arrays of strings"
+    fi
+
+    declare -A seen_domains=()
+    while IFS= read -r d; do
+        [ -n "$d" ] || continue
+        if ! printf '%s' "$d" | grep -Eq '^\.?([A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$'; then
+            die "invalid domain in allowlist: '$d' (expected a host like .example.com or pypi.org)"
+        fi
+        if [ -z "${seen_domains[$d]:-}" ]; then
+            seen_domains[$d]=1
+            ALLOW_DOMAINS="${ALLOW_DOMAINS}${ALLOW_DOMAINS:+ }${d}"
+        fi
+    done <<< "$domains_raw"
+
+    if ! mounts_raw="$(jq -r \
+            '((.mounts // []) + (.projects[$pwd].mounts // []))[]' \
+            --arg pwd "$PWD" "$CONFIG_FILE" 2>/dev/null)"; then
+        die "config '$CONFIG_FILE': 'mounts' must be arrays of strings"
+    fi
+
+    protected="/home /home/agent /etc /usr /bin /sbin /lib /lib64 /var /tmp /root /opt /boot /run /dev /proc /sys /workspace /seed /seed-gh /state"
+
+    declare -A seen=()
+    while IFS= read -r m; do
+        [ -n "$m" ] || continue
+        case "$m" in
+            /*) ;;
+            *)  die "mount path must be absolute: '$m'" ;;
+        esac
+        [ -e "$m" ] || die "mount path does not exist: '$m'"
+        rp="$(realpath -e "$m" 2>/dev/null)" || die "cannot resolve mount path: '$m'"
+        [ "$rp" != "/" ] || die "refusing to mount '/' (would shadow the container filesystem)"
+        for p in $protected; do
+            if [ "$rp" = "$p" ] || [ "${p#"$rp"/}" != "$p" ]; then
+                die "refusing mount '$rp': would shadow container path '$p'"
+            fi
+        done
+        if [ -z "${seen[$rp]:-}" ]; then
+            seen[$rp]=1
+            MOUNT_ARGS+=( -v "$rp:$rp:ro" )
+            echo "copilot-isolated: read-only mount $rp" >&2
+        fi
+    done <<< "$mounts_raw"
+
+    if ! ports_raw="$(jq -r \
+            '((.ports // []) + (.projects[$pwd].ports // []))[]' \
+            --arg pwd "$PWD" "$CONFIG_FILE" 2>/dev/null)"; then
+        die "config '$CONFIG_FILE': 'ports' must be arrays of strings/numbers"
+    fi
+
+    if [ -n "$ports_raw" ]; then
+        bind_ip="${COPILOT_ISOLATED_BIND_IP:-$(tailscale ip -4 2>/dev/null | head -1 || true)}"
+        if [ -z "$bind_ip" ]; then
+            bind_ip=127.0.0.1
+            echo "copilot-isolated: no Tailscale IP found — binding published ports to 127.0.0.1 (host-local only)" >&2
+        fi
+        lane_hash="$(printf '%s' "$PWD" | cksum | cut -d' ' -f1)"
+        lane_base=$(( 20000 + (lane_hash % 2000) * 16 ))
+        declare -A seen_ports=()
+        idx=0
+        while IFS= read -r entry; do
+            [ -n "$entry" ] || continue
+            case "$entry" in
+                *:*) host_port="${entry%%:*}"; cont_port="${entry##*:}" ;;
+                *)   cont_port="$entry";       host_port=$(( lane_base + idx )) ;;
+            esac
+            case "$cont_port" in ''|*[!0-9]*) die "invalid port in config: '$entry' (expected CONTAINER or HOST:CONTAINER)" ;; esac
+            case "$host_port" in ''|*[!0-9]*) die "invalid port in config: '$entry' (expected CONTAINER or HOST:CONTAINER)" ;; esac
+            if [ -z "${seen_ports[$host_port]:-}" ]; then
+                seen_ports[$host_port]=1
+                PORT_ARGS+=( -p "${bind_ip}:${host_port}:${cont_port}" )
+                INPUT_PORTS="${INPUT_PORTS}${INPUT_PORTS:+ }${cont_port}"
+                echo "copilot-isolated: exposing container :${cont_port} -> http://${bind_ip}:${host_port}" >&2
+            fi
+            idx=$(( idx + 1 ))
+        done <<< "$ports_raw"
+    fi
+fi
+
+# --- Launch ------------------------------------------------------------------
+# Mounts:
+#   /workspace           rw  — the current project (only host code path exposed)
+#   /seed                ro  — your real ~/.copilot; copied from, never written
+#   /seed-gh             ro  — your real ~/.config/gh; copied from for auth
+#   /state               rw  — sandbox sessions/logs, host-separate
+#   /home/agent/.copilot/config.json rw — the sandbox's own config.json
+# The entrypoint assembles /home/agent/.copilot from /seed + /state at startup.
+exec docker run --rm -it \
+    --cap-drop ALL --cap-add NET_ADMIN --cap-add SETUID --cap-add SETGID \
+    --security-opt no-new-privileges \
+    --pids-limit 512 --memory 4g --cpus "${COPILOT_ISOLATED_CPUS:-1.5}" \
+    --env-file "$ENVFILE" \
+    -e "SANDBOX_PORTS=$INPUT_PORTS" \
+    -e "SANDBOX_ALLOWLIST=$ALLOW_DOMAINS" \
+    -e "HOST_COPILOT_DIR=$COPILOT_DIR" \
+    -e "SANDBOX_PROJECT_KEY=$PROJECT_KEY" \
+    -e "COPILOT_HOME=/home/agent/.copilot" \
+    ${PORT_ARGS[@]+"${PORT_ARGS[@]}"} \
+    ${MOUNT_ARGS[@]+"${MOUNT_ARGS[@]}"} \
+    -v "$PWD:/workspace" -w /workspace \
+    -v "$COPILOT_DIR:/seed:ro" \
+    -v "$GH_CONFIG_DIR:/seed-gh:ro" \
+    -v "$STATE_DIR:/state" \
+    -v "$STATE_DIR/config.json:/home/agent/.copilot/config.json" \
+    "$IMAGE" "$@"
