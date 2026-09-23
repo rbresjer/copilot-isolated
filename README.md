@@ -416,6 +416,7 @@ sessions.
 ### Additional hardening
 
 - `--cap-drop ALL` — no Linux capabilities for the agent process
+- `--init` — runs a tiny PID 1 reaper so orphaned child processes become reaped instead of permanent zombies
 - `--security-opt no-new-privileges` — cannot regain privileges via setuid binaries
 - `--pids-limit 512` — prevents fork bombs
 - `--memory 4g` — OOM kills rather than swapping the host

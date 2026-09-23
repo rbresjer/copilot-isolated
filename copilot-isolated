@@ -211,6 +211,7 @@ fi
 #   /home/agent/.copilot/config.json rw — the sandbox's own config.json
 # The entrypoint assembles /home/agent/.copilot from /seed + /state at startup.
 exec docker run --rm -it \
+    --init \
     --cap-drop ALL --cap-add NET_ADMIN --cap-add SETUID --cap-add SETGID \
     --security-opt no-new-privileges \
     --pids-limit 512 --memory 4g --cpus "${COPILOT_ISOLATED_CPUS:-1.5}" \

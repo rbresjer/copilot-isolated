@@ -37,3 +37,9 @@ if grep -q 'jq.*trustedFolders' "$entrypoint" && ! grep -q 'jsonc_to_json' "$ent
     echo "FAIL: entrypoint must handle Copilot's JSONC config before updating trustedFolders" >&2
     exit 1
 fi
+
+if ! grep -Eq 'docker run --rm -it[[:space:]]+\\' "$repo_dir/copilot-isolated" \
+        || ! grep -Eq '^[[:space:]]+--init[[:space:]]+\\' "$repo_dir/copilot-isolated"; then
+    echo "FAIL: docker run must enable Docker's init reaper so orphaned agent children cannot accumulate as PID 1 zombies" >&2
+    exit 1
+fi
